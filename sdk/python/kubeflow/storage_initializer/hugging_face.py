@@ -1,16 +1,15 @@
-import logging
 import json
-from typing import Union, Optional
+import logging
 from dataclasses import dataclass, field
+from typing import Optional, Union
 from urllib.parse import urlparse
 
 import transformers
 from peft import LoraConfig
 
-from .constants import VOLUME_PATH_DATASET, VOLUME_PATH_MODEL
-from .abstract_model_provider import modelProvider
 from .abstract_dataset_provider import datasetProvider
-
+from .abstract_model_provider import modelProvider
+from .constants import VOLUME_PATH_DATASET, VOLUME_PATH_MODEL
 
 TRANSFORMER_TYPES = Union[
     transformers.AutoModelForSequenceClassification,
@@ -38,6 +37,7 @@ class HuggingFaceModelParams:
     model_uri: str
     transformer_type: TRANSFORMER_TYPES
     access_token: str = None
+    num_labels: Optional[int] = None
 
     def __post_init__(self):
         # Custom checks or validations can be added here
@@ -46,7 +46,7 @@ class HuggingFaceModelParams:
 
 
 @dataclass
-class HuggingFaceTrainParams:
+class HuggingFaceTrainerParams:
     training_parameters: transformers.TrainingArguments = field(
         default_factory=transformers.TrainingArguments
     )
@@ -77,7 +77,7 @@ class HuggingFace(modelProvider):
 
 
 @dataclass
-class HfDatasetParams:
+class HuggingFaceDatasetParams:
     repo_id: str
     access_token: Optional[str] = None
     # TODO (andreyvelich): Discuss where we should specify dataset preprocess parameters.
@@ -91,7 +91,7 @@ class HfDatasetParams:
 
 class HuggingFaceDataset(datasetProvider):
     def load_config(self, serialised_args):
-        self.config = HfDatasetParams(**json.loads(serialised_args))
+        self.config = HuggingFaceDatasetParams(**json.loads(serialised_args))
 
     def download_dataset(self):
         logger.info("Downloading dataset")

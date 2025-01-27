@@ -12,23 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import multiprocessing
-import logging
-import time
 import json
-from typing import Optional, Callable, Tuple, List, Dict, Any, Set, Union
+import logging
+import multiprocessing
 import queue
-from kubernetes import client, config, watch
+import time
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-from kubeflow.training import models
-from kubeflow.training.api_client import ApiClient
-from kubeflow.training.constants import constants
-from kubeflow.training.utils import utils
 from kubeflow.storage_initializer.constants import (
     VOLUME_PATH_DATASET,
     VOLUME_PATH_MODEL,
 )
-
+from kubeflow.training import models
+from kubeflow.training.api_client import ApiClient
+from kubeflow.training.constants import constants
+from kubeflow.training.utils import utils
+from kubernetes import client, config, watch
 
 logger = logging.getLogger(__name__)
 
@@ -99,41 +98,125 @@ class TrainingClient(object):
         namespace: Optional[str] = None,
         num_workers: int = 1,
         num_procs_per_worker: int = 1,
+        resources_per_worker: Union[dict, client.V1ResourceRequirements, None] = None,
+        model_provider_parameters=None,
+        dataset_provider_parameters=None,
+        trainer_parameters=None,
+        init_env_vars: Optional[
+            Union[Dict[str, str], List[Union[models.V1EnvVar, models.V1EnvVar]]]
+        ] = None,
+        env_vars: Optional[
+            Union[Dict[str, str], List[Union[models.V1EnvVar, models.V1EnvVar]]]
+        ] = None,
         storage_config: Dict[str, Optional[Union[str, List[str]]]] = {
             "size": constants.PVC_DEFAULT_SIZE,
             "storage_class": None,
             "access_modes": constants.PVC_DEFAULT_ACCESS_MODES,
         },
-        model_provider_parameters=None,
-        dataset_provider_parameters=None,
-        train_parameters=None,
-        resources_per_worker: Union[dict, client.V1ResourceRequirements, None] = None,
     ):
-        """
-        Higher level train api
-        model_provider_parameters: It can be of type HuggingFaceModelParams
-        dataset_provider_parameters: It can be of type HfDatasetParams or S3DatasetParams
-        train_parameters: It can be of type HuggingFaceTrainParams
+        """High level API to fine-tune LLMs with distributed PyTorchJob. Follow this guide
+        for more information about this feature: TODO (andreyvelich): Add link.
+
+        It uses the pre-created Storage Initializer to download pre-trained model and dataset, and
+        Trainer to fine-tune LLM. Your cluster should support PVC with ReadOnlyMany access mode
+        to distribute data across PyTorchJob workers.
+
+        It uses `torchrun` CLI to fine-tune model in distributed mode with multiple PyTorchJob
+        workers. Follow this guide to know more about `torchrun` CLI:
+        https://pytorch.org/docs/stable/elastic/run.html
+
+        This feature is in alpha stage and Kubeflow community is looking for your feedback.
+        Please use #kubeflow-training Slack channel or Kubeflow Training Operator GitHub
+        for your questions or suggestions.
+
+        Args:
+            name: Name of the PyTorchJob.
+            namespace: Namespace for the PyTorchJob. By default namespace is taken from
+                `TrainingClient` object.
+            num_workers: Number of PyTorchJob workers.
+            num_procs_per_worker: Number of processes per PyTorchJob worker for `torchrun` CLI. You
+                should use this parameter if you want to use more than 1 GPU per PyTorchJob worker.
+            resources_per_worker: A parameter that lets you specify how much
+                resources each PyTorchJob worker container should have. You can either specify a
+                kubernetes.client.V1ResourceRequirements object (documented here:
+                https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1ResourceRequirements.md)
+                or a dictionary that includes one or more of the following keys:
+                `cpu`, `memory`, or `gpu` (other keys will be ignored). Appropriate
+                values for these keys are documented here:
+                https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/.
+                For example:
+                ```
+                {
+                    "cpu": "1",
+                    "memory": "2Gi",
+                    "gpu": "1",
+                }
+                ```
+                Please note, `gpu` specifies a resource request with a key of
+                `nvidia.com/gpu`, i.e. an NVIDIA GPU. If you need a different type
+                of GPU, pass in a V1ResourceRequirement instance instead, since it's
+                more flexible. This parameter is optional and defaults to None.
+            model_provider_parameters: Parameters for the model provider in the Storage Initializer.
+                For example, HuggingFace model name and Transformer type for that model, like:
+                AutoModelForSequenceClassification. This argument must be the type of
+                `kubeflow.storage_initializer.hugging_face.HuggingFaceModelParams`
+            dataset_provider_parameters: Parameters for the dataset provider in the
+                Storage Initializer. For example, name of the HuggingFace dataset or
+                AWS S3 configuration. This argument must be the type of
+                `kubeflow.storage_initializer.hugging_face.HuggingFaceDatasetParams` or
+                `kubeflow.storage_initializer.s3.S3DatasetParams`
+            trainer_parameters: Parameters for LLM Trainer that will fine-tune pre-trained model
+                with the given dataset. For example, LoRA config for parameter-efficient fine-tuning
+                and HuggingFace training arguments like optimizer or number of training epochs.
+                This argument must be the type of
+                `kubeflow.storage_initializer.HuggingFaceTrainerParams`
+            init_env_vars: Environment variable(s) to be attached to init container.
+                You can specify a dictionary as a mapping object representing the environment
+                variables. Otherwise, you can specify a list, in which the element can either
+                be a kubernetes.client.models.V1EnvVar (documented here:
+                https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1EnvVar.md)
+                or a kubernetes.client.models.V1EnvFromSource (documented here:
+                https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1EnvFromSource.md)
+            env_vars: Environment variable(s) to be attached to training container.
+                You can specify a dictionary as a mapping object representing the environment
+                variables. Otherwise, you can specify a list, in which the element can either
+                be a kubernetes.client.models.V1EnvVar (documented here:
+                https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1EnvVar.md)
+                or a kubernetes.client.models.V1EnvFromSource (documented here:
+                https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1EnvFromSource.md)
+            storage_config: Configuration for Storage Initializer PVC to download pre-trained model
+                and dataset. You can configure PVC size and storage class name in this argument.
         """
         try:
-            import peft
-            import transformers
+            import peft  # noqa: F401
+            import transformers  # noqa: F401
         except ImportError:
             raise ImportError(
                 "Train API dependencies not installed. "
                 + "Run: pip install -U 'kubeflow-training[huggingface]' "
             )
-        from kubeflow.storage_initializer.s3 import S3DatasetParams
+
+        # fmt: off
+
         from kubeflow.storage_initializer.hugging_face import (
+            HuggingFaceDatasetParams,
             HuggingFaceModelParams,
-            HfDatasetParams,
+        )
+        from kubeflow.storage_initializer.s3 import S3DatasetParams
+
+        # fmt: on
+
+        print(
+            "Thank you for using `train` API for LLMs fine-tuning. This feature is in alpha stage "
+            "Kubeflow community is looking for your feedback. Please share your experience "
+            "via #kubeflow-training Slack channel or Kubeflow Training Operator GitHub."
         )
 
         if (
             not name
             or not model_provider_parameters
             or not dataset_provider_parameters
-            or not train_parameters
+            or not trainer_parameters
         ):
             raise ValueError("One of the required parameters is None")
 
@@ -145,7 +228,7 @@ class TrainingClient(object):
             self.core_api.create_namespaced_persistent_volume_claim(
                 namespace=namespace,
                 body=utils.get_pvc_spec(
-                    pvc_name=constants.STORAGE_INITIALIZER,
+                    pvc_name=name,
                     namespace=namespace,
                     storage_config=storage_config,
                 ),
@@ -154,11 +237,8 @@ class TrainingClient(object):
             pvc_list = self.core_api.list_namespaced_persistent_volume_claim(namespace)
             # Check if the PVC with the specified name exists
             for pvc in pvc_list.items:
-                if pvc.metadata.name == constants.STORAGE_INITIALIZER:
-                    print(
-                        f"PVC '{constants.STORAGE_INITIALIZER}' already exists in namespace "
-                        f"{namespace}."
-                    )
+                if pvc.metadata.name == name:
+                    print(f"PVC '{name}' already exists in namespace " f"{namespace}.")
                     break
             else:
                 raise RuntimeError(f"failed to create PVC. Error: {e}")
@@ -172,7 +252,7 @@ class TrainingClient(object):
 
         if isinstance(dataset_provider_parameters, S3DatasetParams):
             dp = "s3"
-        elif isinstance(dataset_provider_parameters, HfDatasetParams):
+        elif isinstance(dataset_provider_parameters, HuggingFaceDatasetParams):
             dp = "hf"
         else:
             raise ValueError(
@@ -194,6 +274,7 @@ class TrainingClient(object):
                 json.dumps(dataset_provider_parameters.__dict__),
             ],
             volume_mounts=[constants.STORAGE_INITIALIZER_VOLUME_MOUNT],
+            env_vars=init_env_vars,
         )
 
         # create app container spec
@@ -205,30 +286,42 @@ class TrainingClient(object):
                 model_provider_parameters.model_uri,
                 "--transformer_type",
                 model_provider_parameters.transformer_type.__name__,
+                "--num_labels",
+                str(model_provider_parameters.num_labels),
                 "--model_dir",
                 VOLUME_PATH_MODEL,
                 "--dataset_dir",
                 VOLUME_PATH_DATASET,
                 "--lora_config",
-                json.dumps(train_parameters.lora_config.__dict__, cls=utils.SetEncoder),
+                json.dumps(
+                    trainer_parameters.lora_config.__dict__, cls=utils.SetEncoder
+                ),
                 "--training_parameters",
-                json.dumps(train_parameters.training_parameters.to_dict()),
+                json.dumps(trainer_parameters.training_parameters.to_dict()),
             ],
             volume_mounts=[constants.STORAGE_INITIALIZER_VOLUME_MOUNT],
             resources=resources_per_worker,
+            env_vars=env_vars,
+        )
+
+        storage_initializer_volume = models.V1Volume(
+            name=constants.STORAGE_INITIALIZER,
+            persistent_volume_claim=models.V1PersistentVolumeClaimVolumeSource(
+                claim_name=name
+            ),
         )
 
         # create worker pod spec
         worker_pod_template_spec = utils.get_pod_template_spec(
             containers=[container_spec],
-            volumes=[constants.STORAGE_INITIALIZER_VOLUME],
+            volumes=[storage_initializer_volume],
         )
 
         # create master pod spec
         master_pod_template_spec = utils.get_pod_template_spec(
             containers=[container_spec],
             init_containers=[init_container_spec],
-            volumes=[constants.STORAGE_INITIALIZER_VOLUME],
+            volumes=[storage_initializer_volume],
         )
 
         job = utils.get_pytorchjob_template(
@@ -251,12 +344,16 @@ class TrainingClient(object):
         base_image: Optional[str] = None,
         train_func: Optional[Callable] = None,
         parameters: Optional[Dict[str, Any]] = None,
-        num_workers: Optional[int] = None,
+        num_workers: Optional[int] = 1,
+        num_procs_per_worker: Optional[Union[int, str]] = None,
         resources_per_worker: Union[dict, models.V1ResourceRequirements, None] = None,
         num_chief_replicas: Optional[int] = None,
         num_ps_replicas: Optional[int] = None,
         packages_to_install: Optional[List[str]] = None,
         pip_index_url: str = constants.DEFAULT_PIP_INDEX_URL,
+        env_vars: Optional[
+            Union[Dict[str, str], List[Union[models.V1EnvVar, models.V1EnvVar]]]
+        ] = None,
     ):
         """Create the Training Job.
         Job can be created using one of the following options:
@@ -267,7 +364,7 @@ class TrainingClient(object):
 
         Args:
             job: Job object. Object must be one of these types: KubeflowOrgV1TFJob,
-                KubeflowOrgV1PyTorchJob, KubeflowOrgV1MXJob, etc.
+                KubeflowOrgV1PyTorchJob, etc.
             name: Name for the Job. It must be set if `job` parameter is omitted.
             namespace: Namespace for the Job. By default namespace is taken from
                 `TrainingClient` object.
@@ -284,6 +381,9 @@ class TrainingClient(object):
                 set, Base Image must support `bash` CLI to execute the training script.
             parameters: Dict of input parameters that training function might receive.
             num_workers: Number of Worker replicas for the Job.
+            num_procs_per_worker: Number of processes per PyTorchJob worker for `torchrun` CLI. You
+                should use this parameter if you want to use more than 1 GPU per PyTorchJob worker.
+                Set to "auto" to automatically use available GPU/CPU PyTorch resources.
             resources_per_worker: A parameter that lets you specify how much
                 resources each Worker container should have. You can either specify a
                 kubernetes.client.V1ResourceRequirements object (documented here:
@@ -311,6 +411,13 @@ class TrainingClient(object):
                 to the base image packages if `train_func` parameter is set.
                 These packages are installed before executing the objective function.
             pip_index_url: The PyPI url from which to install Python packages.
+            env_vars: Environment variable(s) to be attached to training container.
+                You can specify a dictionary as a mapping object representing the environment
+                variables. Otherwise, you can specify a list, in which the element can either
+                be a kubernetes.client.models.V1EnvVar (documented here:
+                https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1EnvVar.md)
+                or a kubernetes.client.models.V1EnvFromSource (documented here:
+                https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1EnvFromSource.md)
 
         Raises:
             ValueError: Invalid input parameters.
@@ -322,7 +429,8 @@ class TrainingClient(object):
         if job is not None:
             for key, value in locals().items():
                 if (
-                    key not in ["self", "job", "namespace", "pip_index_url"]
+                    key
+                    not in ["self", "job", "namespace", "pip_index_url", "num_workers"]
                     and value is not None
                 ):
                     raise ValueError(
@@ -348,20 +456,46 @@ class TrainingClient(object):
                     "Job name must be set to configure Job from function or image"
                 )
 
+            # Check if at least one Worker is set.
+            # TODO (andreyvelich): Remove this check once we have CEL validation.
+            # Ref: https://github.com/kubeflow/training-operator/issues/1708
+            if num_workers is None or num_workers < 1:
+                raise ValueError(f"At least one Worker for {job_kind} must be set")
+
             # Assign the default base image.
             # TODO (andreyvelich): Add base image for other Job kinds.
             if base_image is None:
                 base_image = constants.JOB_PARAMETERS[job_kind]["base_image"]
 
+            # By default we don't set command and args for the training container.
+            command, args = None, None
+
+            # If training function is set get the command and args.
+            if train_func is not None:
+                # Use `torchrun` for distributed PyTorch training, otherwise use `python`
+                if job_kind == constants.PYTORCHJOB_KIND and (
+                    num_workers > 1 or num_procs_per_worker is not None
+                ):
+                    entrypoint = constants.ENTRYPOINT_TORCH
+                else:
+                    entrypoint = constants.ENTRYPOINT_PYTHON
+
+                command, args = utils.get_command_using_train_func(
+                    train_func=train_func,
+                    entrypoint=entrypoint,
+                    train_func_parameters=parameters,
+                    packages_to_install=packages_to_install,
+                    pip_index_url=pip_index_url,
+                )
+
             # Get Training Container template.
             container_spec = utils.get_container_spec(
                 name=constants.JOB_PARAMETERS[job_kind]["container"],
                 base_image=base_image,
-                train_func=train_func,
-                train_func_parameters=parameters,
-                packages_to_install=packages_to_install,
-                pip_index_url=pip_index_url,
+                command=command,
+                args=args,
                 resources=resources_per_worker,
+                env_vars=env_vars,
             )
 
             # Get Pod template spec using the above container.
@@ -372,6 +506,10 @@ class TrainingClient(object):
             # Configure template for different Jobs.
             # TODO (andreyvelich): Add support for other kinds (e.g. MPIJob).
             if job_kind == constants.TFJOB_KIND:
+                if num_procs_per_worker is not None:
+                    raise ValueError(
+                        f"num_procs_per_worker can't be set for {constants.TFJOB_KIND}"
+                    )
                 job = utils.get_tfjob_template(
                     name=name,
                     namespace=namespace,
@@ -380,12 +518,18 @@ class TrainingClient(object):
                     num_chief_replicas=num_chief_replicas,
                     num_ps_replicas=num_ps_replicas,
                 )
-            elif job_kind == constants.PYTORCHJOB_KIND and num_workers:
+            elif job_kind == constants.PYTORCHJOB_KIND:
+                if num_chief_replicas is not None or num_ps_replicas is not None:
+                    raise ValueError(
+                        "num_chief_replicas and num_ps_replicas can't be set for "
+                        f"{constants.PYTORCHJOB_KIND}"
+                    )
                 job = utils.get_pytorchjob_template(
                     name=name,
                     namespace=namespace,
                     worker_pod_template_spec=pod_template_spec,
                     num_workers=num_workers,
+                    num_procs_per_worker=num_procs_per_worker,
                 )
             else:
                 raise ValueError(
@@ -552,7 +696,7 @@ class TrainingClient(object):
             job_kind: Kind for the Job (e.g. `TFJob` or `PyTorchJob`). By default Job kind
                 is taken from `TrainingClient` object.
             job: Job object can be set to get the conditions. Object must be one of
-                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, KubeflowOrgV1MXJob, etc.
+                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, etc.
                 If this parameter is omitted, it gets Job with the given name and kind.
             timeout: Kubernetes API server timeout in seconds to execute the request.
 
@@ -616,7 +760,7 @@ class TrainingClient(object):
             job_kind: Kind for the Job (e.g. `TFJob` or `PyTorchJob`). By default Job kind
                 is taken from `TrainingClient` object.
             job: Job object can be set to get the conditions. Object must be one of
-                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, KubeflowOrgV1MXJob, etc.
+                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, etc.
                 If this parameter is omitted, it gets Job with the given name and kind.
             timeout: Kubernetes API server timeout in seconds to execute the request.
 
@@ -651,7 +795,7 @@ class TrainingClient(object):
             job_kind: Kind for the Job (e.g. `TFJob` or `PyTorchJob`). By default Job kind
                 is taken from `TrainingClient` object.
             job: Job object can be set to get the conditions. Object must be one of
-                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, KubeflowOrgV1MXJob, etc.
+                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, etc.
                 If this parameter is omitted, it gets Job with the given name and kind.
             timeout: Kubernetes API server timeout in seconds to execute the request.
 
@@ -686,7 +830,7 @@ class TrainingClient(object):
             job_kind: Kind for the Job (e.g. `TFJob` or `PyTorchJob`). By default Job kind
                 is taken from `TrainingClient` object.
             job: Job object can be set to get the conditions. Object must be one of
-                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, KubeflowOrgV1MXJob, etc.
+                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, etc.
                 If this parameter is omitted, it gets Job with the given name and kind.
             timeout: Kubernetes API server timeout in seconds to execute the request.
 
@@ -721,7 +865,7 @@ class TrainingClient(object):
             job_kind: Kind for the Job (e.g. `TFJob` or `PyTorchJob`). By default Job kind
                 is taken from `TrainingClient` object.
             job: Job object can be set to get the conditions. Object must be one of
-                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, KubeflowOrgV1MXJob, etc.
+                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, etc.
                 If this parameter is omitted, it gets Job with the given name and kind.
             timeout: Kubernetes API server timeout in seconds to execute the request.
 
@@ -756,7 +900,7 @@ class TrainingClient(object):
             job_kind: Kind for the Job (e.g. `TFJob` or `PyTorchJob`). By default Job kind
                 is taken from `TrainingClient` object.
             job: Job object can be set to get the conditions. Object must be one of
-                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, KubeflowOrgV1MXJob, etc.
+                these types: KubeflowOrgV1TFJob, KubeflowOrgV1PyTorchJob, etc.
                 If this parameter is omitted, it gets Job with the given name and kind.
             timeout: Kubernetes API server timeout in seconds to execute the request.
 
@@ -810,7 +954,8 @@ class TrainingClient(object):
         Raises:
             ValueError: Invalid input parameters.
             TimeoutError: Timeout to get Job.
-            RuntimeError: Failed to get Job or Job reaches unexpected Failed condition.
+            RuntimeError: Failed to get Job, or Job reaches Failed condition and
+                Failed is not in `expected_conditions` set.
         """
 
         namespace = namespace or self.namespace
@@ -831,7 +976,9 @@ class TrainingClient(object):
             )
 
             # Get Job conditions.
-            conditions = self.get_job_conditions(job=job, timeout=timeout)
+            conditions = self.get_job_conditions(
+                job=job, timeout=timeout, job_kind=job_kind
+            )
             if len(conditions) > 0:
                 status_logger(
                     name,
@@ -843,9 +990,9 @@ class TrainingClient(object):
             if callback:
                 callback(job)
 
-            # Raise an exception if Job is Failed and Failed is not expected condition.
+            # Raise an exception if Job is Failed and Failed is not the expected condition.
             if (
-                constants.JOB_CONDITION_FAILED not in conditions
+                constants.JOB_CONDITION_FAILED not in expected_conditions
                 and utils.has_condition(conditions, constants.JOB_CONDITION_FAILED)
             ):
                 raise RuntimeError(
@@ -887,13 +1034,13 @@ class TrainingClient(object):
 
                 For PyTorchJob one of `master` or `worker`.
 
-                For MXJob one of `scheduler`, `server`, or `worker`.
-
                 For XGBoostJob one of `master` or `worker`.
 
                 For MPIJob one of `launcher` or `worker`.
 
                 For PaddleJob one of `master` or `worker`.
+
+                For JAXJob `worker`.
 
             replica_index: Index for the Job replica.
             timeout: Kubernetes API server timeout in seconds to execute the request.
@@ -913,18 +1060,18 @@ class TrainingClient(object):
             replica_type is not None
             and replica_type not in constants.TFJOB_REPLICA_TYPES
             and replica_type not in constants.PYTORCHJOB_REPLICA_TYPES
-            and replica_type not in constants.MXJOB_REPLICA_TYPES
             and replica_type not in constants.XGBOOSTJOB_REPLICA_TYPES
             and replica_type not in constants.MPIJOB_REPLICA_TYPES
             and replica_type not in constants.PADDLEJOB_REPLICA_TYPES
+            and replica_type not in constants.JAXJOB_REPLICA_TYPES
         ):
             raise ValueError(
                 f"TFJob replica type must be one of {constants.TFJOB_REPLICA_TYPES}\n"
                 f"PyTorchJob replica type must be one of {constants.PYTORCHJOB_REPLICA_TYPES}\n"
-                f"MXJob replica type must be one of {constants.MXJOB_REPLICA_TYPES}\n"
                 f"XGBoostJob replica type must be one of {constants.XGBOOSTJOB_REPLICA_TYPES}\n"
                 f"MPIJob replica type must be one of {constants.MPIJOB_REPLICA_TYPES}\n"
                 f"PaddleJob replica type must be one of {constants.PADDLEJOB_REPLICA_TYPES}"
+                f"JAXJob replica type must be one of {constants.PADDLEJOB_REPLICA_TYPES}"
             )
 
         label_selector = f"{constants.JOB_NAME_LABEL}={name}"
@@ -978,13 +1125,13 @@ class TrainingClient(object):
 
                 For PyTorchJob one of `master` or `worker`.
 
-                For MXJob one of `scheduler`, `server`, or `worker`.
-
                 For XGBoostJob one of `master` or `worker`.
 
                 For MPIJob one of `launcher` or `worker`.
 
                 For PaddleJob one of `master` or `worker`.
+
+                For JAXJob `worker`.
 
             replica_index: Index for the Job replica.
             timeout: Kubernetes API server timeout in seconds to execute the request.
@@ -1041,13 +1188,13 @@ class TrainingClient(object):
 
                 For PyTorchJob one of `master` or `worker`.
 
-                For MXJob one of `scheduler`, `server`, or `worker`.
-
                 For XGBoostJob one of `master` or `worker`.
 
                 For MPIJob one of `launcher` or `worker`.
 
                 For PaddleJob one of `master` or `worker`.
+
+                For JAXJob `worker`.
             replica_index: Optional, index for the Job replica.
             container: Pod container to get the logs.
             follow: Whether to follow the log stream of the pod and print logs to StdOut.

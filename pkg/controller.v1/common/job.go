@@ -284,6 +284,11 @@ func (jc *JobController) ReconcileJobs(
 					if !match {
 						return fmt.Errorf("unable to recognize PodGroup: %v", klog.KObj(pg))
 					}
+
+					if q := volcanoPodGroup.Spec.Queue; len(q) > 0 {
+						queue = q
+					}
+
 					volcanoPodGroup.Spec = volcanov1beta1.PodGroupSpec{
 						MinMember:         minMember,
 						Queue:             queue,
@@ -416,7 +421,7 @@ func (jc *JobController) CleanupJob(runPolicy *apiv1.RunPolicy, jobStatus apiv1.
 	currentTime := time.Now()
 	metaObject, _ := job.(metav1.Object)
 	ttl := runPolicy.TTLSecondsAfterFinished
-	if ttl == nil {
+	if ttl == nil || trainutil.IsJobSuspended(runPolicy) {
 		return nil
 	}
 	duration := time.Second * time.Duration(*ttl)
@@ -449,4 +454,11 @@ func (jc *JobController) CleanupJob(runPolicy *apiv1.RunPolicy, jobStatus apiv1.
 
 func (jc *JobController) calcPGMinResources(minMember int32, replicas map[apiv1.ReplicaType]*apiv1.ReplicaSpec) *corev1.ResourceList {
 	return CalcPGMinResources(minMember, replicas, jc.PriorityClassLister.Get)
+}
+
+func (jc *JobController) ManagedByExternalController(controllerName *string) *string {
+	if controllerName != nil && *controllerName != apiv1.KubeflowJobsController {
+		return controllerName
+	}
+	return nil
 }

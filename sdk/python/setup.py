@@ -19,7 +19,7 @@ TESTS_REQUIRES = [
     "pytest-tornasync",
     "mypy",
     "black==24.3.0",
-    "flake==4.0.1",
+    "flake8==4.0.1",
 ]
 
 REQUIRES = [
@@ -27,13 +27,13 @@ REQUIRES = [
     "six>=1.10",
     "setuptools>=21.0.0",
     "urllib3>=1.15.1",
-    "kubernetes>=23.6.0",
+    "kubernetes>=27.2.0",
     "retrying>=1.3.3",
 ]
 
 setuptools.setup(
     name="kubeflow-training",
-    version="1.7.0",
+    version="1.9.0rc0",
     author="Kubeflow Authors",
     author_email="hejinchi@cn.ibm.com",
     license="Apache License Version 2.0",
@@ -48,10 +48,10 @@ setuptools.setup(
         "Intended Audience :: Developers",
         "Intended Audience :: Education",
         "Intended Audience :: Science/Research",
-        "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: OS Independent",
         "Topic :: Scientific/Engineering",
@@ -64,6 +64,6 @@ setuptools.setup(
     tests_require=TESTS_REQUIRES,
     extras_require={
         "test": TESTS_REQUIRES,
-        "huggingface": ["transformers==4.37.2", "peft==0.3.0"],
+        "huggingface": ["transformers==4.38.0", "peft==0.3.0"],
     },
 )
