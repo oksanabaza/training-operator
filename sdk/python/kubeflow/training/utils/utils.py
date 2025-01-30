@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datetime import datetime
-import os
-import logging
-import textwrap
 import inspect
-from typing import Optional, Callable, List, Dict, Any, Tuple, Union
 import json
-import threading
+import logging
+import os
 import queue
+import textwrap
+import threading
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from kubeflow.training.constants import constants
 from kubeflow.training import models
-
+from kubeflow.training.constants import constants
+from kubernetes import config
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,11 @@ def is_running_in_k8s():
 
 def get_default_target_namespace():
     if not is_running_in_k8s():
-        return "default"
+        try:
+            _, current_context = config.list_kube_config_contexts()
+            return current_context["context"]["namespace"]
+        except Exception:
+            return constants.DEFAULT_NAMESPACE
     with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
         return f.readline()
 
@@ -116,10 +120,10 @@ def get_script_for_python_packages(
     script_for_python_packages = textwrap.dedent(
         f"""
         if ! [ -x "$(command -v pip)" ]; then
-            python3 -m ensurepip || python3 -m ensurepip --user || apt-get install python3-pip
+            python -m ensurepip || python -m ensurepip --user || apt-get install python-pip
         fi
 
-        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet \
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python -m pip install --quiet \
         --no-warn-script-location --index-url {pip_index_url} {packages_str}
         """
     )
@@ -128,7 +132,8 @@ def get_script_for_python_packages(
 
 
 def get_command_using_train_func(
-    train_func: Optional[Callable],
+    train_func: Callable,
+    entrypoint: str,
     train_func_parameters: Optional[Dict[str, Any]] = None,
     packages_to_install: Optional[List[str]] = None,
     pip_index_url: str = constants.DEFAULT_PIP_INDEX_URL,
@@ -166,11 +171,11 @@ def get_command_using_train_func(
                 {func_code}
                 EOM
                 printf "%s" \"$SCRIPT\" > \"$program_path/ephemeral_script.py\"
-                python3 -u \"$program_path/ephemeral_script.py\""""
+                {entrypoint} \"$program_path/ephemeral_script.py\""""
     )
 
     # Add function code to the execute script.
-    exec_script = exec_script.format(func_code=func_code)
+    exec_script = exec_script.format(func_code=func_code, entrypoint=entrypoint)
 
     # Install Python packages if that is required.
     if packages_to_install is not None:
@@ -180,19 +185,19 @@ def get_command_using_train_func(
         )
 
     # Return container command and args to execute training function.
-    return ["bash", "-c"], [exec_script]
+    return constants.DEFAULT_COMMAND, [exec_script]
 
 
 def get_container_spec(
     name: str,
     base_image: str,
-    train_func: Optional[Callable] = None,
-    train_func_parameters: Optional[Dict[str, Any]] = None,
-    packages_to_install: Optional[List[str]] = None,
-    pip_index_url: str = constants.DEFAULT_PIP_INDEX_URL,
+    command: Optional[List[str]] = None,
     args: Optional[List[str]] = None,
     resources: Union[dict, models.V1ResourceRequirements, None] = None,
     volume_mounts: Optional[List[models.V1VolumeMount]] = None,
+    env_vars: Optional[
+        Union[Dict[str, str], List[Union[models.V1EnvVar, models.V1EnvVar]]]
+    ] = None,
 ) -> models.V1Container:
     """
     Get container spec for the given parameters.
@@ -201,19 +206,25 @@ def get_container_spec(
     if name is None or base_image is None:
         raise ValueError("Container name or base image cannot be none")
 
+    # Handle env_vars as either a dict or a list
+    if env_vars:
+        if isinstance(env_vars, dict):
+            env_vars = [models.V1EnvVar(name=k, value=v) for k, v in env_vars.items()]
+        elif isinstance(env_vars, list):
+            env_vars = [
+                v if isinstance(v, models.V1EnvVar) else models.V1EnvVar(**v)
+                for v in env_vars
+            ]
+
     # Create initial container spec.
     container_spec = models.V1Container(
-        name=name, image=base_image, args=args, volume_mounts=volume_mounts
+        name=name,
+        image=base_image,
+        command=command,
+        args=args,
+        volume_mounts=volume_mounts,
+        env=env_vars,
     )
-
-    # If training function is set, override container command and args to execute the function.
-    if train_func is not None:
-        container_spec.command, container_spec.args = get_command_using_train_func(
-            train_func=train_func,
-            train_func_parameters=train_func_parameters,
-            packages_to_install=packages_to_install,
-            pip_index_url=pip_index_url,
-        )
 
     # Convert dict to the Kubernetes container resources if that is required.
     if isinstance(resources, dict):
@@ -261,15 +272,10 @@ def get_tfjob_template(
     name: str,
     namespace: str,
     pod_template_spec: models.V1PodTemplateSpec,
-    num_workers: Optional[int] = None,
+    num_workers: int,
     num_chief_replicas: Optional[int] = None,
     num_ps_replicas: Optional[int] = None,
 ):
-    # Check if at least one replica is set.
-    # TODO (andreyvelich): Remove this check once we have CEL validation.
-    # Ref: https://github.com/kubeflow/training-operator/issues/1708
-    if num_workers is None and num_chief_replicas is None and num_ps_replicas is None:
-        raise ValueError("At least one replica for TFJob must be set")
 
     # Create TFJob template.
     tfjob = models.KubeflowOrgV1TFJob(
@@ -316,14 +322,8 @@ def get_pytorchjob_template(
     num_workers: int,
     worker_pod_template_spec: Optional[models.V1PodTemplateSpec],
     master_pod_template_spec: Optional[models.V1PodTemplateSpec] = None,
-    num_procs_per_worker: Optional[int] = None,
-    elastic_policy: Optional[models.KubeflowOrgV1ElasticPolicy] = None,
+    num_procs_per_worker: Optional[Union[int, str]] = None,
 ):
-    # Check if at least one Worker is set.
-    # TODO (andreyvelich): Remove this check once we have CEL validation.
-    # Ref: https://github.com/kubeflow/training-operator/issues/1708
-    if num_workers is None or num_workers < 1:
-        raise ValueError("At least one Worker for PyTorchJob must be set")
 
     # Create PyTorchJob template.
     pytorchjob = models.KubeflowOrgV1PyTorchJob(
@@ -333,11 +333,9 @@ def get_pytorchjob_template(
         spec=models.KubeflowOrgV1PyTorchJobSpec(
             run_policy=models.KubeflowOrgV1RunPolicy(clean_pod_policy=None),
             pytorch_replica_specs={},
-            elastic_policy=elastic_policy,
         ),
     )
 
-    # TODO (andreyvelich): Should we make spec.nproc_per_node int ?
     if num_procs_per_worker:
         pytorchjob.spec.nproc_per_node = str(num_procs_per_worker)
 
@@ -391,7 +389,7 @@ def get_pvc_spec(
     pvc_spec = models.V1PersistentVolumeClaim(
         api_version="v1",
         kind="PersistentVolumeClaim",
-        metadata={"name": pvc_name, "namepsace": namespace},
+        metadata={"name": pvc_name, "namespace": namespace},
         spec=models.V1PersistentVolumeClaimSpec(
             access_modes=storage_config["access_modes"],
             resources=models.V1ResourceRequirements(
@@ -415,7 +413,7 @@ def add_event_to_dict(
 ):
     """Add Kubernetes event to the dict with this format:
     ```
-    {"<Object Kind> <Object Name>": "<Event Timestamp> <Event Message>"}
+    {"<Object Kind>/<Object Name>": "<Event Timestamp> <Event Message>"}
     ```
     """
     if (
@@ -423,10 +421,10 @@ def add_event_to_dict(
         and event.involved_object.name == object_name
         and event.metadata.creation_timestamp >= object_creation_timestamp
     ):
+        event_key = f"{object_kind.lower()}/{object_name}"
         event_time = event.metadata.creation_timestamp.strftime("%Y-%m-%d %H:%M:%S")
         event_msg = f"{event_time} {event.message}"
-        if object_name not in events_dict:
-            events_dict[f"{object_kind} {object_name}"] = [event_msg]
+        if event_key not in events_dict:
+            events_dict[event_key] = [event_msg]
         else:
-            events_dict[f"{object_kind} {object_name}"] += [event_msg]
-    return events_dict
+            events_dict[event_key] += [event_msg]

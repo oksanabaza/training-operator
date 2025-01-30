@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright 2021 The Kubeflow Authors.
 #
@@ -18,8 +18,8 @@
 This script is used for updating generated SDK files.
 """
 
-import os
 import fileinput
+import os
 import re
 
 __replacements = [

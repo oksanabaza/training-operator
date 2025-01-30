@@ -11,9 +11,9 @@ spec:
         spec:
           containers:
             - name: pytorch
-              image: gcr.io/<your_project>/pytorch_dist_mnist:latest
+              image: kubeflow/pytorch-dist-mnist:latest
               args: ["--backend", "nccl"]
-              resources: 
+              resources:
                 limits:
                   nvidia.com/gpu: 1
     Worker:
@@ -21,10 +21,10 @@ spec:
       restartPolicy: OnFailure
       template:
         spec:
-          containers: 
+          containers:
             - name: pytorch
-              image: gcr.io/<your_project>/pytorch_dist_mnist:latest
+              image: kubeflow/pytorch-dist-mnist:latest
               args: ["--backend", "nccl"]
-              resources: 
+              resources:
                 limits:
                   nvidia.com/gpu: 1

@@ -11,22 +11,22 @@ spec:
         spec:
           containers:
             - name: pytorch
-              image: gcr.io/<your_project>/pytorch_dist_mnist:mpi
+              image: kubeflow/pytorch-dist-mnist:latest
               args: ["--backend", "mpi"]
               # Comment out the below resources to use the CPU.
-              resources: 
+              resources:
                 limits:
                   nvidia.com/gpu: 1
     Worker:
       replicas: 1
-      restartPolicy: OnFailure 
+      restartPolicy: OnFailure
       template:
         spec:
-          containers: 
+          containers:
             - name: pytorch
-              image: gcr.io/<your_project>/pytorch_dist_mnist:mpi
+              image: kubeflow/pytorch-dist-mnist:latest
               args: ["--backend", "mpi"]
               # Comment out the below resources to use the CPU.
-              resources: 
+              resources:
                 limits:
                   nvidia.com/gpu: 1
